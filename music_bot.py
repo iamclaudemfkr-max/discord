@@ -18,6 +18,7 @@
 
 import asyncio
 import glob
+import logging
 import os
 import tempfile
 from collections import deque
@@ -27,6 +28,10 @@ import yt_dlp
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+if os.getenv("VOICE_DEBUG"):
+    logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
+    logging.getLogger("discord.gateway").setLevel(logging.DEBUG)
+    logging.getLogger("discord.player").setLevel(logging.DEBUG)
 PREFIX = "!"  # можно поменять на любой другой символ
 
 YDL_OPTS = {
@@ -144,6 +149,25 @@ async def download(url: str) -> str:
     return await asyncio.get_running_loop().run_in_executor(None, _download_sync, url)
 
 
+async def _log_voice_state(vc: discord.VoiceClient, path: str):
+    """Диагностика: шифрование/DAVE и состояние голосового соединения."""
+    await asyncio.sleep(3)
+    conn = getattr(vc, "_connection", None)
+    dave = getattr(conn, "dave_session", None)
+    print(
+        "VOICE:",
+        f"discord.py={discord.__version__}",
+        f"connected={vc.is_connected()} playing={vc.is_playing()}",
+        f"mode={getattr(vc, 'mode', None)}",
+        f"dave_version={getattr(conn, 'dave_protocol_version', None)}",
+        f"dave_ready={getattr(dave, 'ready', None)}",
+        f"dave_downgraded={getattr(conn, 'dave_downgraded', None)}",
+        f"latency={vc.latency:.3f}s",
+        f"file={os.path.getsize(path) if os.path.exists(path) else 'gone'}B",
+        flush=True,
+    )
+
+
 async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
     """Берёт следующий трек из очереди и запускает его."""
     q = get_queue(guild_id)
@@ -170,6 +194,7 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
         asyncio.run_coroutine_threadsafe(play_next(vc, guild_id, channel), bot.loop)
 
     vc.play(source, after=after)
+    asyncio.create_task(_log_voice_state(vc, path))
     await channel.send(f"▶️ Сейчас играет: **{info['title']}**")
 
 
