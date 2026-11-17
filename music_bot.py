@@ -38,13 +38,27 @@ YDL_OPTS = {
 # ("Sign in to confirm you're not a bot").
 # Содержимое файла cookies.txt кладётся в переменную окружения YT_COOKIES,
 # а бот при запуске сам сохраняет его во временный файл.
-_cookies = os.getenv("YT_COOKIES")
+# Надёжнее передавать куки в base64 через YT_COOKIES_B64: хостинги иногда
+# портят табуляции и переносы строк в многострочных переменных.
+_cookies = None
+if os.getenv("YT_COOKIES_B64"):
+    import base64
+    _cookies = base64.b64decode(os.getenv("YT_COOKIES_B64")).decode("utf-8", "replace")
+elif os.getenv("YT_COOKIES"):
+    _cookies = os.getenv("YT_COOKIES").replace("\\n", "\n")
+
 if _cookies:
     COOKIE_PATH = "/tmp/yt_cookies.txt"
+    _cookies = _cookies.replace("\r\n", "\n").strip() + "\n"
     with open(COOKIE_PATH, "w", encoding="utf-8") as f:
-        f.write(_cookies.replace("\\n", "\n").strip() + "\n")
+        f.write(_cookies)
     YDL_OPTS["cookiefile"] = COOKIE_PATH
-    print("Куки YouTube загружены")
+    _lines = [l for l in _cookies.splitlines() if l and not l.startswith("#")]
+    _valid = [l for l in _lines if l.count("\t") >= 6]
+    _yt = [l for l in _valid if "youtube.com" in l]
+    print(f"Куки YouTube: строк {len(_lines)}, корректных {len(_valid)}, для youtube.com {len(_yt)}")
+    if _lines and not _valid:
+        print("⚠️ Куки повреждены (нет табуляций) — используйте YT_COOKIES_B64")
 elif os.path.exists("cookies.txt"):
     YDL_OPTS["cookiefile"] = "cookies.txt"
     print("Куки YouTube загружены из cookies.txt")
