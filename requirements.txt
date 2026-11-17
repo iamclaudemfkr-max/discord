@@ -1,5 +1,5 @@
 discord.py[voice]>=2.7.1
-davey
+davey<0.2
 PyNaCl
 yt-dlp[default]
 deno
