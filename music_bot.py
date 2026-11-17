@@ -17,7 +17,9 @@
 """
 
 import asyncio
+import glob
 import os
+import tempfile
 from collections import deque
 
 import discord
@@ -108,6 +110,40 @@ async def extract(query: str) -> dict:
     return await asyncio.get_running_loop().run_in_executor(None, _run)
 
 
+DOWNLOAD_DIR = tempfile.mkdtemp(prefix="music_")
+
+
+def _download_sync(url: str) -> str:
+    """Скачивает аудио средствами yt-dlp во временный файл.
+
+    ffmpeg напрямую с googlevideo получает 403 (ссылки привязаны к клиенту
+    yt-dlp, нужны чанки и т.д.), а встроенный загрузчик yt-dlp работает.
+    Сначала пробуем без куки (клиенты ios/visionos отдают рабочие ссылки),
+    затем с куки.
+    """
+    base = {k: v for k, v in YDL_OPTS.items() if k != "cookiefile"}
+    attempts = [base]
+    if "cookiefile" in YDL_OPTS:
+        attempts.append(dict(base, cookiefile=YDL_OPTS["cookiefile"]))
+    last = None
+    for opts in attempts:
+        name = os.urandom(6).hex()
+        opts = dict(opts, outtmpl=os.path.join(DOWNLOAD_DIR, name + ".%(ext)s"))
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            files = glob.glob(os.path.join(DOWNLOAD_DIR, name + ".*"))
+            if files:
+                return files[0]
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("не удалось скачать аудио")
+
+
+async def download(url: str) -> str:
+    return await asyncio.get_running_loop().run_in_executor(None, _download_sync, url)
+
+
 async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
     """Берёт следующий трек из очереди и запускает его."""
     q = get_queue(guild_id)
@@ -116,11 +152,9 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
 
     track = q.popleft()
     try:
-        info = await extract(track["page"])
-        opts = dict(FFMPEG_OPTS)
-        if info["headers"]:
-            opts["before_options"] = f'-headers "{info["headers"]}" ' + opts["before_options"]
-        source = discord.FFmpegOpusAudio(info["stream"], **opts)
+        info = {"title": track["title"]}
+        path = await download(track["page"])
+        source = discord.FFmpegOpusAudio(path, options="-vn")
     except Exception as e:
         await channel.send(f"⚠️ Не удалось воспроизвести **{track['title']}**: {e}")
         await play_next(vc, guild_id, channel)
@@ -129,6 +163,10 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
     def after(error):
         if error:
             print(f"Ошибка воспроизведения: {error}")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         asyncio.run_coroutine_threadsafe(play_next(vc, guild_id, channel), bot.loop)
 
     vc.play(source, after=after)
