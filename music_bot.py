@@ -1,15 +1,19 @@
 """
-Музыкальный Discord-бот: играет треки с YouTube (и других сайтов, которые понимает yt-dlp).
+Музыкальный Discord-бот с командами через "!": играет треки с YouTube
+по ссылке, названию или ключевым словам.
 
 Установка:
     pip install -U "discord.py[voice]" yt-dlp
-    + установить ffmpeg (Windows: https://ffmpeg.org, Linux: sudo apt install ffmpeg)
+    + установить ffmpeg
+
+ВАЖНО: в Discord Developer Portal -> Bot -> Privileged Gateway Intents
+включите "MESSAGE CONTENT INTENT", иначе бот не увидит текст команд.
 
 Запуск:
     Windows (PowerShell):  $env:DISCORD_TOKEN="ваш_токен"; python music_bot.py
     Linux/macOS:           DISCORD_TOKEN=ваш_токен python music_bot.py
 
-Команды: /play, /skip, /pause, /resume, /queue, /stop
+Команды: !kill <ссылка или название>, !skip, !pause, !resume, !queue, !stop
 """
 
 import asyncio
@@ -18,9 +22,10 @@ from collections import deque
 
 import discord
 import yt_dlp
-from discord import app_commands
+from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+PREFIX = "!"  # можно поменять на любой другой символ
 
 YDL_OPTS = {
     "format": "bestaudio/best",
@@ -34,8 +39,8 @@ FFMPEG_OPTS = {
 }
 
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+intents.message_content = True  # нужно для команд через "!"
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 # Очередь треков для каждого сервера: guild_id -> deque[{"title", "page"}]
 queues: dict[int, deque] = {}
@@ -58,7 +63,6 @@ async def extract(query: str) -> dict:
                 "stream": info["url"],
             }
 
-    # yt-dlp блокирующий, поэтому выносим в отдельный поток
     return await asyncio.get_running_loop().run_in_executor(None, _run)
 
 
@@ -70,7 +74,6 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
 
     track = q.popleft()
     try:
-        # Прямые ссылки на аудио быстро протухают, поэтому получаем их прямо перед проигрыванием
         info = await extract(track["page"])
         source = discord.FFmpegOpusAudio(info["stream"], **FFMPEG_OPTS)
     except Exception as e:
@@ -81,102 +84,109 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
     def after(error):
         if error:
             print(f"Ошибка воспроизведения: {error}")
-        asyncio.run_coroutine_threadsafe(play_next(vc, guild_id, channel), client.loop)
+        asyncio.run_coroutine_threadsafe(play_next(vc, guild_id, channel), bot.loop)
 
     vc.play(source, after=after)
     await channel.send(f"▶️ Сейчас играет: **{info['title']}**")
 
 
-@tree.command(name="play", description="Включить трек по ссылке или названию")
-@app_commands.describe(query="Ссылка на YouTube или название песни")
-async def play(interaction: discord.Interaction, query: str):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("Сначала зайди в голосовой канал.", ephemeral=True)
+@bot.command(name="kill")
+async def kill(ctx: commands.Context, *, query: str = None):
+    """!kill <ссылка или название> — включить трек."""
+    if not query:
+        await ctx.send(f"Напиши, что включить: `{PREFIX}kill название или ссылка`")
+        return
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("Сначала зайди в голосовой канал.")
         return
 
-    await interaction.response.defer()  # поиск может занять несколько секунд
-
-    channel = interaction.user.voice.channel
-    vc = interaction.guild.voice_client
+    channel = ctx.author.voice.channel
+    vc = ctx.voice_client
     if vc is None:
         vc = await channel.connect()
     elif vc.channel != channel:
         await vc.move_to(channel)
 
-    try:
-        info = await extract(query)
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ Ничего не нашёл: {e}")
-        return
+    async with ctx.typing():  # показывает «бот печатает...», пока идёт поиск
+        try:
+            info = await extract(query)
+        except Exception as e:
+            await ctx.send(f"⚠️ Ничего не нашёл: {e}")
+            return
 
-    q = get_queue(interaction.guild_id)
+    q = get_queue(ctx.guild.id)
     q.append({"title": info["title"], "page": info["page"]})
 
     if vc.is_playing() or vc.is_paused():
-        await interaction.followup.send(f"➕ Добавлено в очередь (#{len(q)}): **{info['title']}**")
+        await ctx.send(f"➕ Добавлено в очередь (#{len(q)}): **{info['title']}**")
     else:
-        await interaction.followup.send(f"🔎 Нашёл: **{info['title']}**")
-        await play_next(vc, interaction.guild_id, interaction.channel)
+        await play_next(vc, ctx.guild.id, ctx.channel)
 
 
-@tree.command(name="skip", description="Пропустить текущий трек")
-async def skip(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
+@bot.command(name="skip")
+async def skip(ctx: commands.Context):
+    vc = ctx.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()  # вызовет after() -> запустится следующий трек
-        await interaction.response.send_message("⏭️ Пропущено.")
+        await ctx.send("⏭️ Пропущено.")
     else:
-        await interaction.response.send_message("Сейчас ничего не играет.", ephemeral=True)
+        await ctx.send("Сейчас ничего не играет.")
 
 
-@tree.command(name="pause", description="Поставить на паузу")
-async def pause(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
+@bot.command(name="pause")
+async def pause(ctx: commands.Context):
+    vc = ctx.voice_client
     if vc and vc.is_playing():
         vc.pause()
-        await interaction.response.send_message("⏸️ Пауза.")
+        await ctx.send("⏸️ Пауза.")
     else:
-        await interaction.response.send_message("Сейчас ничего не играет.", ephemeral=True)
+        await ctx.send("Сейчас ничего не играет.")
 
 
-@tree.command(name="resume", description="Продолжить воспроизведение")
-async def resume(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
+@bot.command(name="resume")
+async def resume(ctx: commands.Context):
+    vc = ctx.voice_client
     if vc and vc.is_paused():
         vc.resume()
-        await interaction.response.send_message("▶️ Продолжаю.")
+        await ctx.send("▶️ Продолжаю.")
     else:
-        await interaction.response.send_message("Нечего продолжать.", ephemeral=True)
+        await ctx.send("Нечего продолжать.")
 
 
-@tree.command(name="queue", description="Показать очередь")
-async def show_queue(interaction: discord.Interaction):
-    q = get_queue(interaction.guild_id)
+@bot.command(name="queue")
+async def show_queue(ctx: commands.Context):
+    q = get_queue(ctx.guild.id)
     if not q:
-        await interaction.response.send_message("Очередь пуста.")
+        await ctx.send("Очередь пуста.")
         return
     lines = [f"{i}. {t['title']}" for i, t in enumerate(list(q)[:15], start=1)]
     if len(q) > 15:
         lines.append(f"…и ещё {len(q) - 15}")
-    await interaction.response.send_message("🎶 **Очередь:**\n" + "\n".join(lines))
+    await ctx.send("🎶 **Очередь:**\n" + "\n".join(lines))
 
 
-@tree.command(name="stop", description="Остановить музыку и выйти из канала")
-async def stop(interaction: discord.Interaction):
-    get_queue(interaction.guild_id).clear()
-    vc = interaction.guild.voice_client
-    if vc:
-        await vc.disconnect()
-    await interaction.response.send_message("⏹️ Остановлено, пока!")
+@bot.command(name="stop")
+async def stop(ctx: commands.Context):
+    get_queue(ctx.guild.id).clear()
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+    await ctx.send("⏹️ Остановлено, пока!")
 
 
-@client.event
+@bot.event
+async def on_command_error(ctx: commands.Context, error):
+    if isinstance(error, commands.CommandNotFound):
+        return  # молча игнорируем неизвестные команды
+    print(f"Ошибка в команде {ctx.command}: {error}")
+    await ctx.send(f"⚠️ Ошибка: {error}")
+
+
+@bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"Бот запущен как {client.user}")
+    print(f"Бот запущен как {bot.user}")
 
 
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Укажи токен в переменной окружения DISCORD_TOKEN")
-    client.run(TOKEN)
+    bot.run(TOKEN)
