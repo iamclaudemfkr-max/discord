@@ -33,6 +33,21 @@ YDL_OPTS = {
     "quiet": True,
     "default_search": "ytsearch",  # можно писать просто название песни
 }
+
+# Куки YouTube: без них YouTube часто не пускает запросы с серверов хостинга
+# ("Sign in to confirm you're not a bot").
+# Содержимое файла cookies.txt кладётся в переменную окружения YT_COOKIES,
+# а бот при запуске сам сохраняет его во временный файл.
+_cookies = os.getenv("YT_COOKIES")
+if _cookies:
+    COOKIE_PATH = "/tmp/yt_cookies.txt"
+    with open(COOKIE_PATH, "w", encoding="utf-8") as f:
+        f.write(_cookies.replace("\\n", "\n").strip() + "\n")
+    YDL_OPTS["cookiefile"] = COOKIE_PATH
+    print("Куки YouTube загружены")
+elif os.path.exists("cookies.txt"):
+    YDL_OPTS["cookiefile"] = "cookies.txt"
+    print("Куки YouTube загружены из cookies.txt")
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
