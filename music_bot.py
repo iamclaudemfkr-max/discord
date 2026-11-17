@@ -79,6 +79,18 @@ def get_queue(guild_id: int) -> deque:
     return queues.setdefault(guild_id, deque())
 
 
+def _stream_headers(ydl, info: dict) -> str:
+    """Заголовки для ffmpeg: googlevideo отдаёт 403, если они не совпадают с запросом yt-dlp."""
+    headers = dict(info.get("http_headers") or {})
+    try:
+        cookie = ydl.cookiejar.get_cookie_header(info["url"])
+    except Exception:
+        cookie = ""
+    if cookie:
+        headers["Cookie"] = cookie
+    return "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+
+
 async def extract(query: str) -> dict:
     """Находит трек и возвращает название, ссылку на страницу и прямую ссылку на аудио."""
     def _run():
@@ -90,6 +102,7 @@ async def extract(query: str) -> dict:
                 "title": info.get("title", "Без названия"),
                 "page": info.get("webpage_url", query),
                 "stream": info["url"],
+                "headers": _stream_headers(ydl, info),
             }
 
     return await asyncio.get_running_loop().run_in_executor(None, _run)
@@ -104,7 +117,10 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
     track = q.popleft()
     try:
         info = await extract(track["page"])
-        source = discord.FFmpegOpusAudio(info["stream"], **FFMPEG_OPTS)
+        opts = dict(FFMPEG_OPTS)
+        if info["headers"]:
+            opts["before_options"] = f'-headers "{info["headers"]}" ' + opts["before_options"]
+        source = discord.FFmpegOpusAudio(info["stream"], **opts)
     except Exception as e:
         await channel.send(f"⚠️ Не удалось воспроизвести **{track['title']}**: {e}")
         await play_next(vc, guild_id, channel)
