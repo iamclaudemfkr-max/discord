@@ -77,7 +77,7 @@ FFMPEG_OPTS = {
 # Аудио-эффекты (ffmpeg -af). Ключ — имя режима, значение — строка фильтров.
 FX_FILTERS: dict[str, str] = {
     "bassboost": "bass=f=60:g=15",                                # усиление низких частот (басбуст)
-    "slowed": "atempo=0.85,aecho=0.8:0.9:60|60:0.4|0.35",         # slowed + reverb
+    "slowed": "asetrate=38098,aresample=48000,atempo=0.85,aecho=0.8:0.9:60|60:0.4|0.35",  # slowed + reverb, pitch -4 semitones
 }
 
 # Режим звучания для каждого сервера: guild_id -> имя режима или None
