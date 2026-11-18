@@ -13,15 +13,14 @@
     Windows (PowerShell):  $env:DISCORD_TOKEN="ваш_токен"; python music_bot.py
     Linux/macOS:           DISCORD_TOKEN=ваш_токен python music_bot.py
 
-Команды: !kill <ссылка или название>, !skip, !pause, !resume, !queue, !stop
+Команды: !kill <ссылка или название>, !skip, !pause, !resume, !queue, !stop, !bassboost, !slowed, !normal
 """
 
 import asyncio
+import glob
 import logging
 import os
-import subprocess
-import sys
-import threading
+import tempfile
 from collections import deque
 
 import discord
@@ -75,6 +74,23 @@ FFMPEG_OPTS = {
     "options": "-vn",
 }
 
+# Аудио-эффекты (ffmpeg -af). Ключ — имя режима, значение — строка фильтров.
+FX_FILTERS: dict[str, str] = {
+    "bassboost": "bass=f=60:g=15",                                # усиление низких частот (басбуст)
+    "slowed": "atempo=0.85,aecho=0.8:0.9:60|60:0.4|0.35",         # slowed + reverb
+}
+
+# Режим звучания для каждого сервера: guild_id -> имя режима или None
+fx_mode: dict[int, str | None] = {}
+
+
+def get_fx(guild_id: int) -> str | None:
+    return fx_mode.get(guild_id)
+
+
+def set_fx(guild_id: int, mode: str | None) -> None:
+    fx_mode[guild_id] = mode
+
 intents = discord.Intents.default()
 intents.message_content = True  # нужно для команд через "!"
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
@@ -116,88 +132,41 @@ async def extract(query: str) -> dict:
     return await asyncio.get_running_loop().run_in_executor(None, _run)
 
 
-class _YTDLPReader:
-    def __init__(self, downloader, stopped: threading.Event, channel, title: str):
-        self._downloader = downloader
-        self._stopped = stopped
-        self._channel = channel
-        self._title = title
-        self._stderr = bytearray()
-        self._finished = False
-        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
-        self._stderr_thread.start()
-
-    def _read_stderr(self):
-        for chunk in iter(lambda: self._downloader.stderr.read(4096), b""):
-            self._stderr.extend(chunk)
-            if len(self._stderr) > 8192:
-                del self._stderr[:-8192]
-
-    def read(self, size: int) -> bytes:
-        if self._finished:
-            return b""
-        data = self._downloader.stdout.read(size)
-        if data:
-            return data
-
-        self._finished = True
-        return_code = self._downloader.wait()
-        self._stderr_thread.join()
-        if return_code and not self._stopped.is_set():
-            error = self._stderr.decode("utf-8", "replace").strip()
-            message = f"⚠️ Ошибка загрузки **{self._title}** (yt-dlp, код {return_code})."
-            if error:
-                message += f"\n```{error[-1500:]}```"
-            asyncio.run_coroutine_threadsafe(self._channel.send(message), bot.loop)
-        self._downloader.stdout.close()
-        self._downloader.stderr.close()
-        return b""
+DOWNLOAD_DIR = tempfile.mkdtemp(prefix="music_")
 
 
-class YTDLPStream(discord.AudioSource):
-    """Подаёт вывод yt-dlp в ffmpeg, не дожидаясь полной загрузки трека."""
+def _download_sync(url: str) -> str:
+    """Скачивает аудио средствами yt-dlp во временный файл.
 
-    def __init__(self, url: str, channel, title: str):
-        self._stopped = threading.Event()
-        command = [
-            sys.executable, "-m", "yt_dlp",
-            "--ignore-config", "--no-playlist", "--quiet", "--no-warnings",
-        ]
-        if "cookiefile" in YDL_OPTS:
-            command.extend(["--cookies", YDL_OPTS["cookiefile"]])
-        command.extend(["--format", YDL_OPTS["format"], "--output", "-", url])
-        downloader = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        self._downloader = downloader
-        reader = _YTDLPReader(downloader, self._stopped, channel, title)
+    ffmpeg напрямую с googlevideo получает 403 (ссылки привязаны к клиенту
+    yt-dlp, нужны чанки и т.д.), а встроенный загрузчик yt-dlp работает.
+    Сначала пробуем без куки (клиенты ios/visionos отдают рабочие ссылки),
+    затем с куки.
+    """
+    base = {k: v for k, v in YDL_OPTS.items() if k != "cookiefile"}
+    attempts = [base]
+    if "cookiefile" in YDL_OPTS:
+        attempts.append(dict(base, cookiefile=YDL_OPTS["cookiefile"]))
+    last = None
+    for opts in attempts:
+        name = os.urandom(6).hex()
+        opts = dict(opts, outtmpl=os.path.join(DOWNLOAD_DIR, name + ".%(ext)s"))
         try:
-            self._ffmpeg = discord.FFmpegOpusAudio(reader, pipe=True, options="-vn")
-        except Exception:
-            self._stopped.set()
-            if downloader.poll() is None:
-                downloader.terminate()
-            downloader.wait()
-            reader._stderr_thread.join()
-            raise
-
-    def read(self) -> bytes:
-        return self._ffmpeg.read()
-
-    def is_opus(self) -> bool:
-        return self._ffmpeg.is_opus()
-
-    def cleanup(self):
-        self._stopped.set()
-        if self._downloader.poll() is None:
-            self._downloader.terminate()
-        self._ffmpeg.cleanup()
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            files = glob.glob(os.path.join(DOWNLOAD_DIR, name + ".*"))
+            if files:
+                return files[0]
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("не удалось скачать аудио")
 
 
-async def _log_voice_state(vc: discord.VoiceClient):
+async def download(url: str) -> str:
+    return await asyncio.get_running_loop().run_in_executor(None, _download_sync, url)
+
+
+async def _log_voice_state(vc: discord.VoiceClient, path: str):
     """Диагностика: шифрование/DAVE и состояние голосового соединения."""
     await asyncio.sleep(3)
     conn = getattr(vc, "_connection", None)
@@ -211,6 +180,7 @@ async def _log_voice_state(vc: discord.VoiceClient):
         f"dave_ready={getattr(dave, 'ready', None)}",
         f"dave_downgraded={getattr(conn, 'dave_downgraded', None)}",
         f"latency={vc.latency:.3f}s",
+        f"file={os.path.getsize(path) if os.path.exists(path) else 'gone'}B",
         flush=True,
     )
 
@@ -223,7 +193,13 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
 
     track = q.popleft()
     try:
-        source = YTDLPStream(track["page"], channel, track["title"])
+        info = {"title": track["title"]}
+        path = await download(track["page"])
+        mode = get_fx(guild_id)
+        ffmpeg_options = "-vn"
+        if mode and mode in FX_FILTERS:
+            ffmpeg_options += f' -af "{FX_FILTERS[mode]}"'
+        source = discord.FFmpegOpusAudio(path, options=ffmpeg_options)
     except Exception as e:
         await channel.send(f"⚠️ Не удалось воспроизвести **{track['title']}**: {e}")
         await play_next(vc, guild_id, channel)
@@ -232,11 +208,17 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
     def after(error):
         if error:
             print(f"Ошибка воспроизведения: {error}")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         asyncio.run_coroutine_threadsafe(play_next(vc, guild_id, channel), bot.loop)
 
     vc.play(source, after=after)
-    asyncio.create_task(_log_voice_state(vc))
-    await channel.send(f"▶️ Сейчас играет: **{track['title']}**")
+    asyncio.create_task(_log_voice_state(vc, path))
+    fx = get_fx(guild_id)
+    suffix = f" (режим: **{fx}**)" if fx else ""
+    await channel.send(f"▶️ Сейчас играет: **{info['title']}**{suffix}")
 
 
 @bot.command(name="kill")
@@ -320,6 +302,34 @@ async def stop(ctx: commands.Context):
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
     await ctx.send("⏹️ Остановлено, пока!")
+
+
+@bot.command(name="bassboost", aliases=["bb"])
+async def bassboost(ctx: commands.Context):
+    """!bassboost (!bb) — режим с усилением басов."""
+    set_fx(ctx.guild.id, "bassboost")
+    await ctx.send("🔊 Режим звучания: **bassboost** (басбуст). Будет применён к следующим трекам в очереди.")
+
+
+@bot.command(name="slowed", aliases=["sr", "slowed+reverb"])
+async def slowed(ctx: commands.Context):
+    """!slowed (!sr, !slowed+reverb) — slowed + reverb."""
+    set_fx(ctx.guild.id, "slowed")
+    await ctx.send("🐌 Режим звучания: **slowed + reverb**. Будет применён к следующим трекам в очереди.")
+
+
+@bot.command(name="normal", aliases=["off", "clearfx", "nofx"])
+async def normal(ctx: commands.Context):
+    """!normal (!off, !clearfx) — убрать эффекты, обычное звучание."""
+    set_fx(ctx.guild.id, None)
+    await ctx.send("✅ Эффекты убраны — обычное звучание.")
+
+
+@bot.command(name="fx")
+async def fx(ctx: commands.Context):
+    """!fx — показать текущий режим звучания."""
+    mode = get_fx(ctx.guild.id)
+    await ctx.send(f"Текущий режим звучания: **{mode or 'отсутствует (обычное)'}**")
 
 
 @bot.event
