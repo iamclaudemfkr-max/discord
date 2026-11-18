@@ -79,7 +79,7 @@ FX_FILTERS: dict[str, str] = {
     "bassboost": "bass=f=60:g=15",                                                                          # усиление низких частот (басбуст)
     "slowed": "asetrate=38098,aresample=48000,atempo=0.85",                                                 # slowed (без реверба), pitch −4 полутона
     "reverb": "aecho=0.8:0.9:60|60:0.4|0.35",                                                               # реверберация/эхо
-    "nightcore": "asetrate=60000,aresample=48000,atempo=1.25",                                              # nightcore: speed ×1.25, pitch +4 полутона
+    "nightcore": "asetrate=53878,aresample=48000,atempo=1.15",                                              # nightcore: speed ×1.25, pitch +4 полутона
 }
 
 # Активные эффекты для каждого сервера: guild_id -> set имён эффектов
