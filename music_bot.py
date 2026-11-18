@@ -13,7 +13,7 @@
     Windows (PowerShell):  $env:DISCORD_TOKEN="ваш_токен"; python music_bot.py
     Linux/macOS:           DISCORD_TOKEN=ваш_токен python music_bot.py
 
-Команды: !kill <ссылка или название>, !skip, !pause, !resume, !queue, !stop, !bassboost, !slowed, !normal
+Команды: !kill <ссылка или название>, !skip, !pause, !resume, !queue, !stop, !bassboost, !slushed, !slushed+reverb, !reverb, !normal
 """
 
 import asyncio
@@ -74,22 +74,33 @@ FFMPEG_OPTS = {
     "options": "-vn",
 }
 
-# Аудио-эффекты (ffmpeg -af). Ключ — имя режима, значение — строка фильтров.
+# Аудио-эффекты (ffmpeg -af). Ключ — имя эффекта, значение — строка фильтров.
 FX_FILTERS: dict[str, str] = {
-    "bassboost": "bass=f=60:g=15",                                # усиление низких частот (басбуст)
-    "slowed": "asetrate=38098,aresample=48000,atempo=0.85,aecho=0.8:0.9:60|60:0.4|0.35",  # slowed + reverb, pitch -4 semitones
+    "bassboost": "bass=f=60:g=15",                                                                          # усиление низких частот (басбуст)
+    "slowed": "asetrate=38098,aresample=48000,atempo=0.85",                                                 # slowed (без реверба), pitch −4 полутона
+    "reverb": "aecho=0.8:0.9:60|60:0.4|0.35",                                                               # реверберация/эхо
 }
 
-# Режим звучания для каждого сервера: guild_id -> имя режима или None
-fx_mode: dict[int, str | None] = {}
+# Активные эффекты для каждого сервера: guild_id -> set имён эффектов
+fx_effects: dict[int, set[str]] = {}
 
 
-def get_fx(guild_id: int) -> str | None:
-    return fx_mode.get(guild_id)
+def get_fx(guild_id: int) -> set[str]:
+    return fx_effects.setdefault(guild_id, set())
 
 
-def set_fx(guild_id: int, mode: str | None) -> None:
-    fx_mode[guild_id] = mode
+def add_fx(guild_id: int, *modes: str) -> None:
+    get_fx(guild_id).update(modes)
+
+
+def remove_fx(guild_id: int, mode: str) -> None:
+    fx = fx_effects.get(guild_id)
+    if fx:
+        fx.discard(mode)
+
+
+def clear_fx(guild_id: int) -> None:
+    fx_effects.pop(guild_id, None)
 
 intents = discord.Intents.default()
 intents.message_content = True  # нужно для команд через "!"
@@ -195,10 +206,11 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
     try:
         info = {"title": track["title"]}
         path = await download(track["page"])
-        mode = get_fx(guild_id)
+        modes = get_fx(guild_id)
+        filters = [FX_FILTERS[m] for m in modes if m in FX_FILTERS]
         ffmpeg_options = "-vn"
-        if mode and mode in FX_FILTERS:
-            ffmpeg_options += f' -af "{FX_FILTERS[mode]}"'
+        if filters:
+            ffmpeg_options += f' -af "{",".join(filters)}"'
         source = discord.FFmpegOpusAudio(path, options=ffmpeg_options)
     except Exception as e:
         await channel.send(f"⚠️ Не удалось воспроизвести **{track['title']}**: {e}")
@@ -217,7 +229,7 @@ async def play_next(vc: discord.VoiceClient, guild_id: int, channel):
     vc.play(source, after=after)
     asyncio.create_task(_log_voice_state(vc, path))
     fx = get_fx(guild_id)
-    suffix = f" (режим: **{fx}**)" if fx else ""
+    suffix = f" (эффекты: {', '.join(sorted(fx))})" if fx else ""
     await channel.send(f"▶️ Сейчас играет: **{info['title']}**{suffix}")
 
 
@@ -306,30 +318,48 @@ async def stop(ctx: commands.Context):
 
 @bot.command(name="bassboost", aliases=["bb"])
 async def bassboost(ctx: commands.Context):
-    """!bassboost (!bb) — режим с усилением басов."""
-    set_fx(ctx.guild.id, "bassboost")
-    await ctx.send("🔊 Режим звучания: **bassboost** (басбуст). Будет применён к следующим трекам в очереди.")
+    """!bassboost (!bb) — добавить эффект bassboost."""
+    add_fx(ctx.guild.id, "bassboost")
+    fx = get_fx(ctx.guild.id)
+    await ctx.send(f"🔊 Эффект **bassboost** добавлен. Активные эффекты: {', '.join(sorted(fx)) or '—'}")
 
 
-@bot.command(name="slowed", aliases=["sr", "slowed+reverb"])
-async def slowed(ctx: commands.Context):
-    """!slowed (!sr, !slowed+reverb) — slowed + reverb."""
-    set_fx(ctx.guild.id, "slowed")
-    await ctx.send("🐌 Режим звучания: **slowed + reverb**. Будет применён к следующим трекам в очереди.")
+@bot.command(name="slushed")
+async def slushed(ctx: commands.Context):
+    """!slushed — добавить slowed (без реверба), pitch −4 полутона."""
+    add_fx(ctx.guild.id, "slowed")
+    fx = get_fx(ctx.guild.id)
+    await ctx.send(f"🐌 Эффект **slushed** добавлен. Активные эффекты: {', '.join(sorted(fx)) or '—'}")
+
+
+@bot.command(name="slushed+reverb", aliases=["sr"])
+async def slushed_reverb(ctx: commands.Context):
+    """!slushed+reverb (!sr) — добавить slowed + reverb."""
+    add_fx(ctx.guild.id, "slowed", "reverb")
+    fx = get_fx(ctx.guild.id)
+    await ctx.send(f"🐌🎧 Эффекты **slushed + reverb** добавлены. Активные эффекты: {', '.join(sorted(fx)) or '—'}")
+
+
+@bot.command(name="reverb", aliases=["rvb"])
+async def reverb_cmd(ctx: commands.Context):
+    """!reverb (!rvb) — добавить реверберацию."""
+    add_fx(ctx.guild.id, "reverb")
+    fx = get_fx(ctx.guild.id)
+    await ctx.send(f"🎧 Эффект **reverb** добавлен. Активные эффекты: {', '.join(sorted(fx)) or '—'}")
 
 
 @bot.command(name="normal", aliases=["off", "clearfx", "nofx"])
 async def normal(ctx: commands.Context):
-    """!normal (!off, !clearfx) — убрать эффекты, обычное звучание."""
-    set_fx(ctx.guild.id, None)
-    await ctx.send("✅ Эффекты убраны — обычное звучание.")
+    """!normal (!off, !clearfx) — убрать все эффекты, обычное звучание."""
+    clear_fx(ctx.guild.id)
+    await ctx.send("✅ Все эффекты убраны — обычное звучание.")
 
 
 @bot.command(name="fx")
 async def fx(ctx: commands.Context):
-    """!fx — показать текущий режим звучания."""
+    """!fx — показать текущие эффекты звучания."""
     mode = get_fx(ctx.guild.id)
-    await ctx.send(f"Текущий режим звучания: **{mode or 'отсутствует (обычное)'}**")
+    await ctx.send(f"Активные эффекты: {', '.join(sorted(mode)) or 'отсутствуют (обычное)'}")
 
 
 @bot.event
